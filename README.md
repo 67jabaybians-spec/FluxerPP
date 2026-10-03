@@ -1,6 +1,8 @@
 # Fluxer++
 **Fluxer++** is a native **C++ SDK** for building fast, reliable Fluxer bots. It provides a REST client, real‑time gateway handling, type‑safe models, and an event‑driven architecture on top of modern C++20.
 
+The original repo will no longer be maintained as I have lost that account. This will be the main repo.
+
 Fluxer++ is a young, in-progress SDK — this README describes what actually exists and compiles today, not the eventual feature set. See [Bottlenecks](#-bottlenecks) for known gaps.
 
 ---
@@ -9,7 +11,13 @@ Fluxer++ is a young, in-progress SDK — this README describes what actually exi
 [Project Structure](#-project-structure) · [Installation](#-installation) · [Getting Started](#-getting-started) · [REST API Usage](#-rest-api-usage) · [Gateway & Events](#-gateway--events) · [Models](#-models) · [Logging](#-logging) · [Error Handling](#-error-handling) · [Bottlenecks](#-bottlenecks) · [Contributing](#-contributing) · [License](#-license) · [Installation](#-installation)
 
 ---
+## Coming real soon
 
+- Linux/MacOS build
+
+- Proper guild caching
+
+---
 ## ✨ Features
 - **C++20 core**, built and tested against MSYS2 UCRT64 + libcurl + WinHTTP
 - **Event‑driven gateway** — register callbacks for ready, message creation, guild creation, and heartbeat latency
