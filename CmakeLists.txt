@@ -3,119 +3,154 @@ project(FluxerPP VERSION 0.1.0 LANGUAGES CXX)
 
 option(FLUXERPP_BUILD_SHARED "Build Fluxer++ as a shared library" ON)
 option(FLUXERPP_BUILD_STATIC "Build Fluxer++ as a static library" ON)
+option(FLUXERPP_BUILD_EXAMPLES "Build the example bots" ON)
+option(FLUXERPP_BUILD_TESTS "Build the fluxerpp consumer smoke test" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
 
 include(GNUInstallDirs)
 
-# Dependencies
-find_package(CURL REQUIRED)
-
-# Fluxer++ library
-if(FLUXERPP_BUILD_SHARED)
-    add_library(fluxerpp SHARED
-        src/FluxerClient.cpp
-        src/RestClient.cpp
-        src/GatewayClient.cpp
-        src/EventDispatcher.cpp
-        src/models/Message.cpp
-        src/models/User.cpp
-        src/models/Attachment.cpp
-        src/models/Embed.cpp
-        src/models/EmbedAuthor.cpp
-        src/models/EmbedField.cpp
-        src/models/EmbedFooter.cpp
-        src/models/EmbedImage.cpp
-        src/models/EmbedThumbnail.cpp
-        src/models/EmbedVideo.cpp
-        src/models/Reaction.cpp
-        src/models/File.cpp
-        src/models/Channel.cpp
-        src/models/Role.cpp
-        src/models/Member.cpp
-        src/models/Guild.cpp
-    )
+if(NOT FLUXERPP_BUILD_SHARED AND NOT FLUXERPP_BUILD_STATIC)
+    message(FATAL_ERROR "Enable at least one of FLUXERPP_BUILD_SHARED / FLUXERPP_BUILD_STATIC")
 endif()
 
-# if(FLUXERPP_BUILD_STATIC)
-#     add_library(fluxerpp_static STATIC
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/FluxerClient.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/RestClient.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/GatewayClient.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/EventDispatcher.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/models/Message.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/models/User.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/models/Attachment.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/models/Embed.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/models/EmbedAuthor.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/models/EmbedField.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/models/EmbedFooter.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/models/EmbedImage.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/models/EmbedThumbnail.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/models/EmbedVideo.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/models/Reaction.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/models/File.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/models/Channel.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/models/Role.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/models/Member.cpp
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/models/Guild.cpp
-#     )
-# endif()
+# -----------------------------
+# Dependencies
+# -----------------------------
+# libcurl >= 7.86 is required for the WebSocket API used by GatewayClient
+# (8.11+ recommended, WebSockets were experimental before that).
+find_package(CURL 7.86 REQUIRED)
+find_package(Threads REQUIRED)
+# Header-only; Ubuntu: nlohmann-json3-dev, macOS: brew install nlohmann-json,
+# MSYS2: mingw-w64-x86_64-nlohmann-json
+find_package(nlohmann_json 3 REQUIRED)
 
-target_include_directories(fluxerpp
-    PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:include>
+# -----------------------------
+# Sources
+# -----------------------------
+set(FLUXERPP_SOURCES
+    src/FluxerClient.cpp
+    src/RestClient.cpp
+    src/GatewayClient.cpp
+    src/EventDispatcher.cpp
+    src/models/Message.cpp
+    src/models/User.cpp
+    src/models/Attachment.cpp
+    src/models/Embed.cpp
+    src/models/EmbedAuthor.cpp
+    src/models/EmbedField.cpp
+    src/models/EmbedFooter.cpp
+    src/models/EmbedImage.cpp
+    src/models/EmbedThumbnail.cpp
+    src/models/EmbedVideo.cpp
+    src/models/Reaction.cpp
+    src/models/File.cpp
+    src/models/Channel.cpp
+    src/models/Role.cpp
+    src/models/Member.cpp
+    src/models/Guild.cpp
 )
 
-# target_include_directories(fluxerpp_static
-#     PUBLIC
-#         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-#         $<INSTALL_INTERFACE:include>
-# )
+# Shared setup applied to every library flavour.
+function(fluxerpp_configure tgt)
+    target_include_directories(${tgt}
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    )
+    target_link_libraries(${tgt}
+        PUBLIC
+            CURL::libcurl
+            Threads::Threads
+            nlohmann_json::nlohmann_json
+    )
+    if(WIN32)
+        # Winsock is needed for WSAPoll in GatewayClient (WinHTTP is no longer used).
+        target_link_libraries(${tgt} PUBLIC ws2_32)
+    endif()
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${tgt} PRIVATE -Wall -Wextra)
+    endif()
+endfunction()
 
-if(WIN32)
-    target_link_libraries(fluxerpp PUBLIC winhttp ws2_32)
+set(FLUXERPP_TARGETS "")
+
+# -----------------------------
+# Shared library
+# -----------------------------
+if(FLUXERPP_BUILD_SHARED)
+    add_library(fluxerpp SHARED ${FLUXERPP_SOURCES})
+    fluxerpp_configure(fluxerpp)
+    set_target_properties(fluxerpp PROPERTIES
+        VERSION ${PROJECT_VERSION}
+        SOVERSION ${PROJECT_VERSION_MAJOR}
+        POSITION_INDEPENDENT_CODE ON
+        # No __declspec(dllexport) macros in the headers yet, so export all
+        # symbols on Windows (MinGW does this on its own; this also covers MSVC).
+        WINDOWS_EXPORT_ALL_SYMBOLS ON
+    )
+    list(APPEND FLUXERPP_TARGETS fluxerpp)
 endif()
 
-target_link_libraries(fluxerpp PUBLIC CURL::libcurl)
+# -----------------------------
+# Static library
+# -----------------------------
+if(FLUXERPP_BUILD_STATIC)
+    add_library(fluxerpp_static STATIC ${FLUXERPP_SOURCES})
+    fluxerpp_configure(fluxerpp_static)
+    set_target_properties(fluxerpp_static PROPERTIES
+        OUTPUT_NAME fluxerpp
+        POSITION_INDEPENDENT_CODE ON
+    )
+    list(APPEND FLUXERPP_TARGETS fluxerpp_static)
+endif()
 
+# What examples/tests link against: prefer static so the exes run without
+# DLL / rpath setup.
+if(FLUXERPP_BUILD_STATIC)
+    set(FLUXERPP_LINK_TARGET fluxerpp_static)
+else()
+    set(FLUXERPP_LINK_TARGET fluxerpp)
+endif()
+
+# -----------------------------
 # Example bot
-add_executable(ping_bot examples/ping_bot.cpp)
-target_link_libraries(ping_bot PRIVATE fluxerpp)
-
-if(WIN32)
-    set_target_properties(ping_bot PROPERTIES LINK_FLAGS "-Wl,-subsystem,console")
+# -----------------------------
+if(FLUXERPP_BUILD_EXAMPLES)
+    add_executable(ping_bot examples/ping_bot.cpp)
+    target_link_libraries(ping_bot PRIVATE ${FLUXERPP_LINK_TARGET})
 endif()
 
+# -----------------------------
 # Optional smoke test
-option(FLUXERPP_BUILD_TESTS "Build the fluxerpp consumer smoke test" ON)
+# -----------------------------
 if(FLUXERPP_BUILD_TESTS)
     add_executable(fluxerpp_consumer_smoke_test tests/consumer_smoke_test.cpp)
-    target_link_libraries(fluxerpp_consumer_smoke_test PRIVATE fluxerpp)
+    target_link_libraries(fluxerpp_consumer_smoke_test PRIVATE ${FLUXERPP_LINK_TARGET})
 endif()
 
 # -----------------------------
-# INSTALL RULES (MSYS2 + CMake)
+# INSTALL RULES
 # -----------------------------
-
-# Install library (DLL, import lib, static lib)
 install(
-    TARGETS fluxerpp
+    TARGETS ${FLUXERPP_TARGETS}
     EXPORT Fluxer++Targets
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}     # fluxerpp.dll
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}     # libfluxerpp.dll.a
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}     # libfluxerpp.a
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}      # fluxerpp.dll
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}      # libfluxerpp.so / .dylib
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}      # libfluxerpp.a / libfluxerpp.dll.a
 )
 
-# Install headers
 install(
     DIRECTORY include/fluxerpp/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/fluxerpp
 )
 
-# Export CMake targets
 install(
     EXPORT Fluxer++Targets
     FILE Fluxer++Targets.cmake
@@ -123,7 +158,6 @@ install(
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Fluxer++
 )
 
-# Generate version file
 include(CMakePackageConfigHelpers)
 
 write_basic_package_version_file(
@@ -132,14 +166,14 @@ write_basic_package_version_file(
     COMPATIBILITY SameMajorVersion
 )
 
-# Configure main config file
+# cmake/Fluxer++Config.cmake.in must call find_dependency() for everything
+# the targets link publicly, see the note in the chat reply.
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Fluxer++Config.cmake.in"
     "${CMAKE_CURRENT_BINARY_DIR}/Fluxer++Config.cmake"
     @ONLY
 )
 
-# Install config + version files
 install(
     FILES
         "${CMAKE_CURRENT_BINARY_DIR}/Fluxer++Config.cmake"
