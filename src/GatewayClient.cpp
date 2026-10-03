@@ -1,47 +1,62 @@
 // src/GatewayClient.cpp
+//
+// Cross-platform (Windows / Linux / macOS) gateway client.
+// Transport is libcurl's WebSocket API (curl >= 7.86, stable from 8.11), the
+// same library RestClient already uses, so there is no new dependency.
 #include "fluxerpp/GatewayClient.h"
 #include "fluxerpp/RestClient.h"
+
 #include "fluxerpp/models/Guild.h"
 #include "fluxerpp/models/Message.h"
 #include "fluxerpp/util/Logger.h"
-#include <windows.h>
-#include <winhttp.h>
-#include <nlohmann/json.hpp>
-#include <thread>
-#include <chrono>
-#include <string>
-#include <atomic>
-#include <mutex>
-#include <vector>
-#include <functional>
 
-#pragma comment(lib, "winhttp.lib")
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+
+#ifdef _WIN32
+  #include <winsock2.h>   // WSAPoll
+#else
+  #include <poll.h>
+#endif
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <functional>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#if LIBCURL_VERSION_NUM < 0x075600
+  #error "fluxerpp GatewayClient needs libcurl >= 7.86.0 with WebSocket support (8.11+ recommended)"
+#endif
 
 namespace fluxerpp {
 
 using util::Logger;
 
-static std::wstring to_wide(const std::string& s) {
-    if (s.empty()) return std::wstring();
-    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    std::wstring w(len, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], len);
-    if (!w.empty() && w.back() == L'\0') w.pop_back(); // drop the extra null MultiByteToWideChar wrote
-    return w;
-}
+// ---------------------------------------------------------------------------
+// URL helper
+// ---------------------------------------------------------------------------
 
-// Splits a "wss://host[:port]/path?query" URL into host and path+query.
-// Path defaults to "/" if the URL has none.
+// Splits a "wss://host[:port]/path?query" URL into scheme, host and path+query.
+// Path defaults to "/" and scheme defaults to "wss" if absent.
 struct ParsedWsUrl {
     std::string host;
     std::string path;
+    std::string scheme = "wss";
 };
 
 static ParsedWsUrl parse_ws_url(const std::string& url) {
     ParsedWsUrl out;
     std::string rest = url;
     auto schemePos = rest.find("://");
-    if (schemePos != std::string::npos) rest = rest.substr(schemePos + 3);
+    if (schemePos != std::string::npos) {
+        out.scheme = rest.substr(0, schemePos);
+        rest = rest.substr(schemePos + 3);
+    }
 
     auto slashPos = rest.find('/');
     if (slashPos == std::string::npos) {
@@ -55,52 +70,205 @@ static ParsedWsUrl parse_ws_url(const std::string& url) {
     return out;
 }
 
-// --- RAII for WinHTTP handles -----------------------------------------
-//
-// Previously every failure branch in connect() manually called
-// WinHttpCloseHandle() in the right order for whichever handles had been
-// opened so far, repeated across ~6 branches. Any C++ exception thrown
-// between acquiring a handle and reaching that branch's cleanup (e.g. from
-// nlohmann::json parsing a malformed payload) would skip the cleanup
-// entirely and leak the handle. Single-owner, move-only wrapper — closes
-// automatically on any scope exit, including exception unwinding.
-class WinHttpHandle {
-public:
-    WinHttpHandle() = default;
-    explicit WinHttpHandle(HINTERNET h) : h_(h) {}
-    WinHttpHandle(const WinHttpHandle&) = delete;
-    WinHttpHandle& operator=(const WinHttpHandle&) = delete;
-    WinHttpHandle(WinHttpHandle&& other) noexcept : h_(other.h_) { other.h_ = nullptr; }
-    WinHttpHandle& operator=(WinHttpHandle&& other) noexcept {
-        if (this != &other) { close(); h_ = other.h_; other.h_ = nullptr; }
-        return *this;
-    }
-    ~WinHttpHandle() { close(); }
+// ---------------------------------------------------------------------------
+// libcurl global init (once, thread-safe)
+// ---------------------------------------------------------------------------
 
-    HINTERNET get() const { return h_; }
-    explicit operator bool() const { return h_ != nullptr; }
-    void close() { if (h_) { WinHttpCloseHandle(h_); h_ = nullptr; } }
+static void ensure_curl_init() {
+    static std::once_flag flag;
+    std::call_once(flag, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+}
+
+// ---------------------------------------------------------------------------
+// WsConnection: owns one libcurl WebSocket connection (RAII)
+// ---------------------------------------------------------------------------
+//
+// libcurl easy handles are NOT thread-safe, but this client sends from the
+// heartbeat thread while the main thread receives. All curl_ws_* calls
+// therefore go through `mu_`. That is cheap because the receive side is
+// non-blocking (CURLE_AGAIN): the main thread holds the lock only for the
+// instant it takes to drain what is already buffered, and does its waiting
+// in wait_readable() *outside* the lock.
+//
+// Cancelling a blocked receive (stop(), missed heartbeat ACK) no longer needs
+// the "close the handle from another thread" trick WinHTTP required. Callers
+// set an atomic flag and the receive loop notices within kPollMs.
+class WsConnection {
+public:
+    enum class RecvStatus { Message, Again, Close, Error };
+
+    WsConnection() = default;
+    WsConnection(const WsConnection&) = delete;
+    WsConnection& operator=(const WsConnection&) = delete;
+    ~WsConnection() {
+        if (curl_) curl_easy_cleanup(curl_);
+    }
+
+    bool open(const std::string& url, std::string& err) {
+        curl_ = curl_easy_init();
+        if (!curl_) { err = "curl_easy_init failed"; return false; }
+
+        errbuf_[0] = '\0';
+        curl_easy_setopt(curl_, CURLOPT_ERRORBUFFER, errbuf_);
+        curl_easy_setopt(curl_, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl_, CURLOPT_CONNECT_ONLY, 2L); // 2 = WebSocket
+        curl_easy_setopt(curl_, CURLOPT_HTTP_VERSION, static_cast<long>(CURL_HTTP_VERSION_1_1));
+        curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT, 10L);
+        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYHOST, 2L);
+        curl_easy_setopt(curl_, CURLOPT_USERAGENT, "FluxerPP/1.0");
+        // Deliberately no CURLOPT_TIMEOUT: it would kill a healthy long-lived socket.
+
+        CURLcode rc = curl_easy_perform(curl_); // performs TCP + TLS + WS upgrade
+        if (rc != CURLE_OK) {
+            err = std::string(curl_easy_strerror(rc));
+            if (errbuf_[0]) err += std::string(" (") + errbuf_ + ")";
+            return false;
+        }
+
+        if (curl_easy_getinfo(curl_, CURLINFO_ACTIVESOCKET, &sock_) != CURLE_OK) {
+            sock_ = CURL_SOCKET_BAD;
+        }
+        return true;
+    }
+
+    // Sends one complete text message. Thread-safe.
+    CURLcode send_text(const std::string& payload) {
+        std::lock_guard<std::mutex> lk(mu_);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        size_t off = 0;
+        while (off < payload.size()) {
+            size_t sent = 0;
+            CURLcode rc = curl_ws_send(curl_, payload.data() + off, payload.size() - off,
+                                       &sent, 0, CURLWS_TEXT);
+            off += sent;
+            if (rc == CURLE_AGAIN) {
+                if (std::chrono::steady_clock::now() > deadline) return CURLE_OPERATION_TIMEDOUT;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
+            if (rc != CURLE_OK) return rc;
+        }
+        return CURLE_OK;
+    }
+
+    // Best-effort polite close. Thread-safe.
+    void send_close(std::uint16_t code) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!curl_) return;
+        unsigned char payload[2] = {
+            static_cast<unsigned char>(code >> 8),
+            static_cast<unsigned char>(code & 0xFF)
+        };
+        size_t sent = 0;
+        curl_ws_send(curl_, payload, sizeof(payload), &sent, 0, CURLWS_CLOSE);
+    }
+
+    // Non-blocking. Appends text-frame payload bytes to `acc`.
+    //   Message : `acc` now holds one complete, reassembled text message
+    //   Again   : nothing (more) to read right now; `acc` may hold a partial message
+    //   Close   : server sent a CLOSE frame; `closeCode` is set (0 if none given)
+    //   Error   : transport failed; see last_error()
+    //
+    // Fragment reassembly: libcurl reports each frame/fragment with flags. A
+    // message is complete once a chunk has no CURLWS_CONT flag AND no bytes
+    // remain in the current frame. Same idea as the old WinHTTP
+    // FRAGMENT / MESSAGE buffer types.
+    RecvStatus recv_message(std::string& acc, int& closeCode) {
+        std::lock_guard<std::mutex> lk(mu_);
+        char buf[16 * 1024];
+
+        for (;;) {
+            size_t got = 0;
+            const struct curl_ws_frame* meta = nullptr;
+            CURLcode rc = curl_ws_recv(curl_, buf, sizeof(buf), &got, &meta);
+
+            if (rc == CURLE_AGAIN) return RecvStatus::Again;
+            if (rc != CURLE_OK) {
+                last_error_ = curl_easy_strerror(rc);
+                if (errbuf_[0]) last_error_ += std::string(" (") + errbuf_ + ")";
+                return RecvStatus::Error;
+            }
+            if (!meta) continue;
+
+            if (meta->flags & CURLWS_CLOSE) {
+                closeCode = (got >= 2)
+                    ? ((static_cast<unsigned char>(buf[0]) << 8) | static_cast<unsigned char>(buf[1]))
+                    : 0;
+                return RecvStatus::Close;
+            }
+
+            // Ping/pong: libcurl auto-replies to pings by default; just skip.
+            if (meta->flags & (CURLWS_PING | CURLWS_PONG)) continue;
+
+            const bool finalChunk = !(meta->flags & CURLWS_CONT) && meta->bytesleft == 0;
+
+            // Binary messages aren't used by this JSON gateway: discard them,
+            // including any continuation fragments that follow.
+            if (meta->flags & CURLWS_BINARY) skipping_binary_ = true;
+            if (skipping_binary_) {
+                if (finalChunk) skipping_binary_ = false;
+                continue;
+            }
+
+            acc.append(buf, got);
+            if (finalChunk) return RecvStatus::Message;
+        }
+    }
+
+    // Waits up to `ms` for the socket to become readable. Call WITHOUT
+    // holding any lock (it doesn't take one).
+    void wait_readable(int ms) const {
+        if (sock_ == CURL_SOCKET_BAD) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            return;
+        }
+#ifdef _WIN32
+        WSAPOLLFD fd{};
+        fd.fd = sock_;
+        fd.events = POLLRDNORM;
+        WSAPoll(&fd, 1, ms);
+#else
+        pollfd fd{};
+        fd.fd = sock_;
+        fd.events = POLLIN;
+        poll(&fd, 1, ms);
+#endif
+    }
+
+    const std::string& last_error() const { return last_error_; }
 
 private:
-    HINTERNET h_{nullptr};
+    CURL* curl_{nullptr};
+    curl_socket_t sock_{CURL_SOCKET_BAD};
+    std::mutex mu_;
+    char errbuf_[CURL_ERROR_SIZE] = {};
+    std::string last_error_;
+    bool skipping_binary_{false};
 };
 
-// --- RAII for the heartbeat thread -------------------------------------
+// ---------------------------------------------------------------------------
+// RAII for the heartbeat thread
+// ---------------------------------------------------------------------------
 //
-// Previously heartbeat cleanup (stop flag + join) only ran at the bottom of
-// each connection attempt's happy path. If any exception escaped between
-// starting the thread and reaching that code — e.g. an unexpected JSON
-// field type deep in dispatch handling — stack unwinding would destroy a
-// still-joinable std::thread and call std::terminate() per its destructor
-// contract. This guard's destructor runs on every exit path (normal break
-// *or* exception unwinding) because C++ destroys stack locals in reverse
-// declaration order regardless of how the scope is left.
+// Destructor runs on every exit path (normal break *or* exception unwinding),
+// so a still-joinable std::thread is never destroyed (which would call
+// std::terminate). Also wakes the thread's interruptible sleep so join()
+// returns immediately instead of waiting out a full heartbeat interval.
 class HeartbeatGuard {
 public:
-    HeartbeatGuard(std::thread& t, std::atomic<bool>& stopFlag, std::atomic<bool>& runningFlag)
-        : thread_(t), stop_(stopFlag), running_(runningFlag) {}
+    HeartbeatGuard(std::thread& t,
+                   std::atomic<bool>& stopFlag,
+                   std::atomic<bool>& runningFlag,
+                   std::mutex& m,
+                   std::condition_variable& cv)
+        : thread_(t), stop_(stopFlag), running_(runningFlag), m_(m), cv_(cv) {}
     ~HeartbeatGuard() {
-        stop_.store(true);
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            stop_.store(true);
+        }
+        cv_.notify_all();
         if (thread_.joinable()) thread_.join();
         running_.store(false);
     }
@@ -111,20 +279,16 @@ private:
     std::thread& thread_;
     std::atomic<bool>& stop_;
     std::atomic<bool>& running_;
+    std::mutex& m_;
+    std::condition_variable& cv_;
 };
 
-// Helper: send a UTF-8 text message over WinHTTP WebSocket
-static DWORD send_websocket_message(HINTERNET hWebSocket, const std::string& payload) {
-    return WinHttpWebSocketSend(
-        hWebSocket,
-        WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
-        (void*)payload.data(),
-        static_cast<DWORD>(payload.size())
-    );
-}
+// ---------------------------------------------------------------------------
+// Payload builders
+// ---------------------------------------------------------------------------
 
-// Build IDENTIFY payload (sent after HELLO). Never logged in full — see the
-// IDENTIFY-sent log line below, which only logs a redacted token.
+// IDENTIFY payload (sent after HELLO). Never logged in full; the IDENTIFY-sent
+// log line only logs a redacted token.
 static std::string build_identify(const std::string& token) {
     nlohmann::json identify = {
         {"op", 2},
@@ -132,7 +296,7 @@ static std::string build_identify(const std::string& token) {
             {"token", token},
             {"intents", 0},
             {"properties", {
-                {"os", "windows"},
+                {"os", "windows"},   // arbitrary label for the gateway; change if you like
                 {"browser", "fluxerpp"},
                 {"device", "fluxerpp"}
             }}
@@ -153,14 +317,9 @@ static std::string build_resume(const std::string& token, const std::string& ses
     return resume.dump();
 }
 
-// NOTE on message reassembly:
-// WinHTTP's WebSocket API can split one logical message across several
-// WinHttpWebSocketReceive calls. It marks every chunk of a message except
-// the last as WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE, and only the
-// final chunk as WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE. We accumulate
-// every chunk regardless of type and only parse+clear `acc` once WinHTTP
-// reports the MESSAGE type, meaning the message is fully reassembled —
-// matching what aiohttp/browsers do transparently for you.
+// ---------------------------------------------------------------------------
+// GatewayClient
+// ---------------------------------------------------------------------------
 
 GatewayClient::GatewayClient(const std::string& t)
     : token(t) { }
@@ -186,24 +345,22 @@ void GatewayClient::on_heartbeat_ack(const std::function<void()>& cb) {
 }
 
 void GatewayClient::stop() {
+    // The receive loop polls with a short timeout and checks this flag, so
+    // connect() returns within ~100ms. No cross-thread handle closing needed.
     stop_requested_.store(true);
-    // Force-cancel a blocking receive so connect() notices promptly rather
-    // than waiting for the next server message. Same idempotent pattern
-    // the heartbeat thread uses on a missed ACK — safe if both race to
-    // close the same handle.
-    void* h = active_ws_handle_.exchange(nullptr);
-    if (h) WinHttpCloseHandle(static_cast<HINTERNET>(h));
 }
 
 void GatewayClient::connect() {
+    ensure_curl_init();
+
+    constexpr int kPollMs = 100;
+
     int reconnectAttempt = 0;
 
     std::string session_id;
     int last_seq = -1;
     // Tracks whether the *server* told us the session is resumable (via
-    // op 9 INVALID_SESSION's `d` field, or a 4009 close code). The
-    // reconnect decision below uses this directly instead of a second,
-    // separately-initialized local that used to shadow and discard it.
+    // op 9 INVALID_SESSION's `d` field, or a 4009 close code).
     bool session_resumable = true;
 
     // Resolve the real gateway URL via GET /gateway/bot before dialing
@@ -217,183 +374,88 @@ void GatewayClient::connect() {
             Logger::instance().info("Resolved gateway via /gateway/bot: " + url);
         } catch (const std::exception& ex) {
             Logger::instance().error(std::string("GET /gateway/bot failed: ") + ex.what() +
-                                      " — falling back to " + fallback_host);
+                                      " - falling back to " + fallback_host);
         }
     } else {
-        Logger::instance().warn("No RestClient bound (call bind_rest()) — using fallback_host " +
+        Logger::instance().warn("No RestClient bound (call bind_rest()) - using fallback_host " +
                                  fallback_host + " instead of resolving /gateway/bot");
     }
 
-    std::wstring wHost = to_wide(resolved.host);
-    std::string queryChar = (resolved.path.find('?') == std::string::npos) ? "?" : "&";
-    std::wstring wPath = to_wide(resolved.path + queryChar + "v=" + gateway_version + "&encoding=json");
+    const std::string queryChar = (resolved.path.find('?') == std::string::npos) ? "?" : "&";
+    const std::string fullUrl = resolved.scheme + "://" + resolved.host + resolved.path +
+                                queryChar + "v=" + gateway_version + "&encoding=json";
 
     while (true) {
         if (stop_requested_.load()) {
-            Logger::instance().info("stop() was called — not (re)connecting.");
+            Logger::instance().info("stop() was called - not (re)connecting.");
             break;
         }
 
-        WinHttpHandle hSession(WinHttpOpen(
-            L"FluxerPP/1.0",
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-            WINHTTP_NO_PROXY_NAME,
-            WINHTTP_NO_PROXY_BYPASS,
-            0
-        ));
-
-        if (!hSession) {
-            Logger::instance().error("WinHttpOpen failed");
-            return;
-        }
-
-        WinHttpHandle hConnect(WinHttpConnect(
-            hSession.get(),
-            wHost.c_str(),
-            INTERNET_DEFAULT_HTTPS_PORT,
-            0
-        ));
-
-        if (!hConnect) {
-            Logger::instance().error("WinHttpConnect failed");
-            return; // hSession closes automatically
-        }
-
-        WinHttpHandle hRequest(WinHttpOpenRequest(
-            hConnect.get(),
-            L"GET",
-            wPath.c_str(),
-            NULL,
-            WINHTTP_NO_REFERER,
-            WINHTTP_DEFAULT_ACCEPT_TYPES,
-            WINHTTP_FLAG_SECURE
-        ));
-
-        if (!hRequest) {
-            Logger::instance().error("WinHttpOpenRequest failed");
-            return; // hConnect, hSession close automatically
-        }
-
-        BOOL opt = WinHttpSetOption(hRequest.get(), WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0);
-        if (!opt) {
-            Logger::instance().error("Failed to set WebSocket upgrade option");
-            return;
-        }
-
-        if (!WinHttpSendRequest(hRequest.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-            !WinHttpReceiveResponse(hRequest.get(), NULL)) {
-            Logger::instance().error("WebSocket handshake failed");
-            return;
-        }
-
-        HINTERNET rawWebSocket = WinHttpWebSocketCompleteUpgrade(hRequest.get(), (DWORD_PTR)NULL);
-        hRequest.close(); // WinHTTP's documented pattern: close the request handle right after upgrade, win or lose
-
-        if (!rawWebSocket) {
-            Logger::instance().error("WebSocket upgrade failed");
-            return;
-        }
-
-        // active_ws_handle_ mirrors this connection attempt's live socket so
-        // stop() (any thread) and the heartbeat thread's missed-ACK path can
-        // both force-cancel a blocking receive via the same atomic exchange
-        // — whichever gets there first wins, the other sees nullptr and
-        // no-ops, so it's safe even if both race.
-        active_ws_handle_.store(static_cast<void*>(rawWebSocket));
-        struct ActiveHandleGuard {
-            std::atomic<void*>& slot;
-            HINTERNET h;
-            ~ActiveHandleGuard() {
-                // Only clear/close if nobody else (stop()/missed-ACK) already did.
-                void* expected = h;
-                if (slot.compare_exchange_strong(expected, nullptr)) {
-                    WinHttpCloseHandle(h);
-                }
-            }
-        } activeHandleGuard{active_ws_handle_, rawWebSocket};
-
-        Logger::instance().info("Connected via WinHTTP WebSocket");
-
-        std::string acc;
-        const size_t BUF_SZ = 16 * 1024;
-        std::vector<char> buffer(BUF_SZ);
-        DWORD bytesRead = 0;
-        WINHTTP_WEB_SOCKET_BUFFER_TYPE bufferType = WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE;
-
-        std::atomic<int> heartbeat_interval_ms{0};
-        std::atomic<bool> heartbeat_running{false};
-        std::atomic<bool> stop_heartbeat{false};
-        // Set true right after we send any heartbeat (scheduled or
-        // server-requested), cleared on op 11 (HEARTBEAT ACK). If it's
-        // still true when the heartbeat thread wakes up to send the next
-        // one, the previous ACK never arrived — previously this was never
-        // checked at all, so a half-dead connection with no ACKs could sit
-        // blocked in WinHttpWebSocketReceive indefinitely.
-        std::atomic<bool> awaiting_ack{false};
-        std::mutex seq_mutex;
-        std::thread heartbeatThread;
-        // Declared *after* the thread/atomics it references so it destructs
-        // *before* them (reverse declaration order) on every exit path —
-        // see the class comment above.
-        HeartbeatGuard heartbeatGuard(heartbeatThread, stop_heartbeat, heartbeat_running);
-
-        bool identified_or_resumed = false;
         bool connectionClosed = false;
-        USHORT closeStatus = 0;
-        WCHAR closeReason[512] = {};
-        DWORD closeReasonLength = 0;
+        int closeStatus = 0;
 
-        bool want_resume = !session_id.empty();
+        // Declared before the heartbeat machinery so it is destroyed AFTER the
+        // heartbeat thread has been joined (reverse declaration order).
+        WsConnection ws;
+        std::string openErr;
 
-        while (true) {
-            DWORD hr = WinHttpWebSocketReceive(
-                rawWebSocket,
-                reinterpret_cast<BYTE*>(buffer.data()),
-                static_cast<DWORD>(buffer.size()),
-                &bytesRead,
-                &bufferType
-            );
+        if (!ws.open(fullUrl, openErr)) {
+            // Previously a failed connect returned from connect() entirely.
+            // Now it goes through the normal backoff/retry path below so a
+            // transient network outage at startup doesn't kill the client.
+            Logger::instance().error("WebSocket connect failed: " + openErr);
+            connectionClosed = true;
+        } else {
+            Logger::instance().info("Connected via libcurl WebSocket");
 
-            if (hr != NO_ERROR) {
-                if (stop_requested_.load()) {
-                    Logger::instance().info("Receive canceled by stop().");
-                } else {
-                    Logger::instance().warn("Receive failed, code=" + std::to_string(hr));
+            std::string acc;
+
+            std::atomic<int> heartbeat_interval_ms{0};
+            std::atomic<bool> heartbeat_running{false};
+            std::atomic<bool> stop_heartbeat{false};
+            // Set by the heartbeat thread when it decides the connection is
+            // dead (missed ACK / send failure). Replaces force-closing the
+            // socket handle from another thread.
+            std::atomic<bool> force_close{false};
+            // Set true right after we send any heartbeat (scheduled or
+            // server-requested), cleared on op 11 (HEARTBEAT ACK). If still
+            // true when the next heartbeat is due, the previous ACK never
+            // arrived.
+            std::atomic<bool> awaiting_ack{false};
+            std::mutex seq_mutex;
+            std::mutex hb_mutex;
+            std::condition_variable hb_cv;
+            std::thread heartbeatThread;
+            HeartbeatGuard heartbeatGuard(heartbeatThread, stop_heartbeat, heartbeat_running,
+                                          hb_mutex, hb_cv);
+
+            bool identified_or_resumed = false;
+            const bool want_resume = !session_id.empty();
+
+            while (!stop_requested_.load() && !force_close.load()) {
+                int closeCode = 0;
+                WsConnection::RecvStatus st = ws.recv_message(acc, closeCode);
+
+                if (st == WsConnection::RecvStatus::Again) {
+                    ws.wait_readable(kPollMs);
+                    continue;
                 }
 
-                closeStatus = 0;
-                closeReasonLength = sizeof(closeReason);
-                DWORD queryHr = WinHttpWebSocketQueryCloseStatus(
-                    rawWebSocket, &closeStatus, closeReason, closeReasonLength, &closeReasonLength
-                );
-                if (queryHr == NO_ERROR) {
-                    Logger::instance().warn("Close status=" + std::to_string(closeStatus));
+                if (st == WsConnection::RecvStatus::Error) {
+                    Logger::instance().warn("Receive failed: " + ws.last_error());
+                    closeStatus = 0;
+                    connectionClosed = true;
+                    break;
                 }
 
-                connectionClosed = true;
-                break;
-            }
-
-            if (bufferType == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) {
-                closeStatus = 0;
-                closeReasonLength = sizeof(closeReason);
-                WinHttpWebSocketQueryCloseStatus(
-                    rawWebSocket, &closeStatus, closeReason, closeReasonLength, &closeReasonLength
-                );
-                Logger::instance().info("Received CLOSE frame, status=" + std::to_string(closeStatus));
-                connectionClosed = true;
-                break;
-            }
-
-            if (bufferType == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE ||
-                bufferType == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE) {
-                acc.append(buffer.data(), bytesRead);
-
-                if (bufferType == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE) {
-                    continue; // more of this message is still coming
+                if (st == WsConnection::RecvStatus::Close) {
+                    closeStatus = closeCode;
+                    Logger::instance().info("Received CLOSE frame, status=" + std::to_string(closeStatus));
+                    connectionClosed = true;
+                    break;
                 }
 
+                // st == Message: `acc` holds one fully reassembled text message.
                 std::string js = std::move(acc);
                 acc.clear();
 
@@ -401,15 +463,10 @@ void GatewayClient::connect() {
                     Logger::instance().debug("RAW FRAME: " + js);
                 }
 
-                // Everything from here through dispatch used to only have
-                // json::parse guarded by try/catch. data.value("op", -1)
-                // and friends can themselves throw nlohmann::json::type_error
-                // if a field exists with an unexpected type — e.g. "op" sent
-                // as a string. That exception used to propagate out of this
-                // whole block uncaught, unwinding past a still-joinable
-                // heartbeatThread and calling std::terminate(). Wrapping the
-                // full parse-through-dispatch sequence closes that gap: a
-                // malformed message is now logged and skipped, not fatal.
+                // The whole parse-through-dispatch sequence is wrapped: a
+                // field with an unexpected type (e.g. "op" sent as a string)
+                // makes nlohmann throw type_error. A malformed message is
+                // logged and skipped, not fatal.
                 try {
                     nlohmann::json data = nlohmann::json::parse(js);
 
@@ -437,15 +494,25 @@ void GatewayClient::connect() {
                             stop_heartbeat.store(false);
                             heartbeatThread = std::thread([&]() {
                                 using namespace std::chrono;
+
+                                // Sleep that wakes immediately when the guard
+                                // requests shutdown.
+                                auto interruptible_sleep = [&](int ms) {
+                                    std::unique_lock<std::mutex> lk(hb_mutex);
+                                    hb_cv.wait_for(lk, milliseconds(ms),
+                                                   [&] { return stop_heartbeat.load(); });
+                                };
+
                                 int local_interval = heartbeat_interval_ms.load();
                                 if (local_interval <= 0) local_interval = 41250;
-                                std::this_thread::sleep_for(milliseconds(local_interval / 2));
-                                while (!stop_heartbeat.load()) {
+                                interruptible_sleep(local_interval / 2);
+
+                                while (!stop_heartbeat.load() &&
+                                       !force_close.load() &&
+                                       !stop_requested_.load()) {
                                     if (awaiting_ack.load()) {
-                                        Logger::instance().warn(
-                                            "Missed heartbeat ACK — forcing reconnect");
-                                        void* h = active_ws_handle_.exchange(nullptr);
-                                        if (h) WinHttpCloseHandle(static_cast<HINTERNET>(h));
+                                        Logger::instance().warn("Missed heartbeat ACK - forcing reconnect");
+                                        force_close.store(true);
                                         break;
                                     }
 
@@ -456,44 +523,47 @@ void GatewayClient::connect() {
                                     }
                                     nlohmann::json hb;
                                     hb["op"] = 1;
-                                    hb["d"] = (seq_snapshot == -1) ? nlohmann::json(nullptr) : nlohmann::json(seq_snapshot);
+                                    hb["d"] = (seq_snapshot == -1) ? nlohmann::json(nullptr)
+                                                                   : nlohmann::json(seq_snapshot);
 
-                                    void* sockRaw = active_ws_handle_.load();
-                                    if (!sockRaw) break; // already closed elsewhere
-                                    DWORD sendHr = send_websocket_message(static_cast<HINTERNET>(sockRaw), hb.dump());
-                                    if (sendHr != NO_ERROR) {
-                                        Logger::instance().warn("Heartbeat send failed, code=" + std::to_string(sendHr));
+                                    CURLcode sendRc = ws.send_text(hb.dump());
+                                    if (sendRc != CURLE_OK) {
+                                        Logger::instance().warn(std::string("Heartbeat send failed: ") +
+                                                                curl_easy_strerror(sendRc));
+                                        force_close.store(true);
                                         break;
                                     }
-                                    // Timestamped right after the confirmed send, not before —
-                                    // hb.dump()'s serialization time shouldn't count toward
-                                    // the latency measured when the ACK comes back.
+                                    // Timestamped right after the confirmed send so
+                                    // serialization time doesn't count toward latency.
                                     last_hb_sent_.store(std::chrono::steady_clock::now());
                                     awaiting_ack.store(true);
 
                                     int sleep_ms = heartbeat_interval_ms.load();
                                     if (sleep_ms <= 0) sleep_ms = local_interval;
-                                    std::this_thread::sleep_for(milliseconds(sleep_ms));
+                                    interruptible_sleep(sleep_ms);
                                 }
                             });
                         }
 
                         if (want_resume && !identified_or_resumed) {
                             std::string resumePayload = build_resume(this->token, session_id, last_seq);
-                            DWORD sendHr = send_websocket_message(rawWebSocket, resumePayload);
-                            if (sendHr == NO_ERROR) {
-                                Logger::instance().info("Sent RESUME (session_id=" + session_id + ", seq=" + std::to_string(last_seq) + ")");
+                            CURLcode sendRc = ws.send_text(resumePayload);
+                            if (sendRc == CURLE_OK) {
+                                Logger::instance().info("Sent RESUME (session_id=" + session_id +
+                                                        ", seq=" + std::to_string(last_seq) + ")");
                                 identified_or_resumed = true;
                             } else {
-                                Logger::instance().warn("RESUME send failed, code=" + std::to_string(sendHr) + " — will IDENTIFY");
+                                Logger::instance().warn(std::string("RESUME send failed: ") +
+                                                        curl_easy_strerror(sendRc) + " - will IDENTIFY");
                             }
                         }
 
                         if (!identified_or_resumed) {
                             std::string identifyPayload = build_identify(this->token);
-                            DWORD sendHr = send_websocket_message(rawWebSocket, identifyPayload);
-                            if (sendHr != NO_ERROR) {
-                                Logger::instance().error("IDENTIFY send failed, code=" + std::to_string(sendHr));
+                            CURLcode sendRc = ws.send_text(identifyPayload);
+                            if (sendRc != CURLE_OK) {
+                                Logger::instance().error(std::string("IDENTIFY send failed: ") +
+                                                         curl_easy_strerror(sendRc));
                                 connectionClosed = true;
                             } else {
                                 Logger::instance().info("Sent IDENTIFY (token=" + Logger::redact(this->token) + ")");
@@ -506,11 +576,8 @@ void GatewayClient::connect() {
 
                         if (t == "READY") {
                             try { session_id = data["d"].value("session_id", session_id); } catch (...) {}
-                            // A successful READY means this connection attempt
-                            // worked end to end — reset the backoff counter so
-                            // an unrelated disconnect much later in the
-                            // process's life doesn't inherit a nearly-exhausted
-                            // budget from a rocky start hours ago.
+                            // A successful READY means this attempt worked end to
+                            // end - reset the backoff counter.
                             reconnectAttempt = 0;
                             session_resumable = true;
                             Logger::instance().info("READY received; session_id=" + session_id);
@@ -540,35 +607,33 @@ void GatewayClient::connect() {
                         }
                         nlohmann::json hb;
                         hb["op"] = 1;
-                        hb["d"] = (seq_snapshot == -1) ? nlohmann::json(nullptr) : nlohmann::json(seq_snapshot);
+                        hb["d"] = (seq_snapshot == -1) ? nlohmann::json(nullptr)
+                                                       : nlohmann::json(seq_snapshot);
 
-                        DWORD sendHr = send_websocket_message(rawWebSocket, hb.dump());
-                        if (sendHr != NO_ERROR) {
-                            Logger::instance().warn("Heartbeat (response) send failed, code=" + std::to_string(sendHr));
+                        CURLcode sendRc = ws.send_text(hb.dump());
+                        if (sendRc != CURLE_OK) {
+                            Logger::instance().warn(std::string("Heartbeat (response) send failed: ") +
+                                                    curl_easy_strerror(sendRc));
                             connectionClosed = true;
                         } else {
-                            // This is the fix for the bug where a
-                            // server-requested heartbeat's ACK would measure
-                            // latency against whenever the *previous*
-                            // scheduled heartbeat went out, not this one —
-                            // last_hb_sent_ needs updating here too, same as
-                            // the scheduled loop above.
+                            // Update last_hb_sent_ here too so the ACK for a
+                            // server-requested heartbeat measures latency
+                            // against THIS send, not the previous scheduled one.
                             last_hb_sent_.store(std::chrono::steady_clock::now());
                             awaiting_ack.store(true);
                         }
 
                     } else if (op == 7) { // RECONNECT
                         Logger::instance().info("Server requested reconnect (OP 7)");
-                        // Deliberately does NOT touch session_resumable —
-                        // RECONNECT always implies "come back and resume",
-                        // unlike INVALID SESSION which explicitly tells us
-                        // whether resuming is possible.
+                        // Deliberately does NOT touch session_resumable -
+                        // RECONNECT always implies "come back and resume".
                         connectionClosed = true;
 
                     } else if (op == 9) { // INVALID SESSION
                         bool resumable = false;
                         try { resumable = data["d"].get<bool>(); } catch (...) {}
-                        Logger::instance().warn(std::string("INVALID SESSION (resumable=") + (resumable ? "true" : "false") + ")");
+                        Logger::instance().warn(std::string("INVALID SESSION (resumable=") +
+                                                (resumable ? "true" : "false") + ")");
                         session_resumable = resumable;
                         if (!resumable) {
                             session_id.clear();
@@ -581,10 +646,6 @@ void GatewayClient::connect() {
                         auto now = std::chrono::steady_clock::now();
                         auto sent = last_hb_sent_.load();
                         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - sent).count();
-                        // Routed through EventDispatcher (mutex-guarded,
-                        // per-callback try/catch) rather than invoking raw
-                        // std::function members directly — see the header
-                        // comment on why the previous version was a data race.
                         dispatcher.dispatch_latency(static_cast<int>(ms));
                         dispatcher.dispatch_heartbeat_ack();
                         if (debug_logging_) Logger::instance().debug("Heartbeat ACK");
@@ -599,18 +660,23 @@ void GatewayClient::connect() {
                 }
 
                 if (connectionClosed) break;
+            } // end receive loop
 
-            } else if (bufferType == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE ||
-                       bufferType == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE) {
-                continue; // binary frames aren't used by this JSON gateway
-            } else {
-                continue;
+            // The heartbeat thread asked for a reconnect (missed ACK / send failure).
+            if (force_close.load() && !stop_requested_.load()) {
+                connectionClosed = true;
             }
-        } // end receive loop
 
-        // heartbeatGuard, activeHandleGuard, hRequest/hConnect/hSession all
-        // clean up automatically here via RAII as this scope ends (reverse
-        // declaration order), including on the stop_requested_ exit path.
+            // Polite shutdown. Skipped for forced reconnects so the session
+            // stays resumable (a 1000 close would invalidate it).
+            if (stop_requested_.load()) {
+                Logger::instance().info("Receive loop ending due to stop().");
+                ws.send_close(1000);
+            }
+
+            // heartbeatGuard joins the heartbeat thread here, then `ws` is
+            // destroyed when the enclosing scope ends. RAII on every exit path.
+        }
 
         if (stop_requested_.load()) {
             break;
@@ -631,20 +697,27 @@ void GatewayClient::connect() {
 
         reconnectAttempt++;
         if (reconnectAttempt > max_reconnect_attempts) {
-            Logger::instance().error("Max reconnect attempts reached (" + std::to_string(max_reconnect_attempts) + "). Giving up.");
+            Logger::instance().error("Max reconnect attempts reached (" +
+                                     std::to_string(max_reconnect_attempts) + "). Giving up.");
             break;
         }
 
         int backoffSeconds = (1 << (reconnectAttempt - 1));
         if (backoffSeconds > 30) backoffSeconds = 30;
-        Logger::instance().info("Reconnecting in " + std::to_string(backoffSeconds) + "s (attempt " + std::to_string(reconnectAttempt) + ")");
-        std::this_thread::sleep_for(std::chrono::seconds(backoffSeconds));
+        Logger::instance().info("Reconnecting in " + std::to_string(backoffSeconds) +
+                                "s (attempt " + std::to_string(reconnectAttempt) + ")");
+
+        // Sleep in small slices so stop() isn't stuck waiting out a 30s backoff.
+        for (int waited = 0; waited < backoffSeconds * 1000 && !stop_requested_.load(); waited += 100) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
 
         if (!session_resumable) {
             session_id.clear();
             last_seq = -1;
         } else if (!session_id.empty()) {
-            Logger::instance().info("Attempting resume on reconnect (session_id=" + session_id + ", seq=" + std::to_string(last_seq) + ")");
+            Logger::instance().info("Attempting resume on reconnect (session_id=" + session_id +
+                                    ", seq=" + std::to_string(last_seq) + ")");
         }
     } // end outer reconnect loop
 }
