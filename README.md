@@ -6,6 +6,11 @@ The original repo will no longer be maintained as I have lost that account. This
 Fluxer++ is a young, in-progress SDK — this README describes what actually exists and compiles today, not the eventual feature set. See [Bottlenecks](#-bottlenecks) for known gaps.
 
 ---
+## Badges
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Jw4Lk3r16/Fluxer.cpp)
+
+---
 ## Quick links
 
 [Project Structure](#-project-structure) · [Installation](#-installation) · [Getting Started](#-getting-started) · [REST API Usage](#-rest-api-usage) · [Gateway & Events](#-gateway--events) · [Models](#-models) · [Logging](#-logging) · [Error Handling](#-error-handling) · [Bottlenecks](#-bottlenecks) · [Contributing](#-contributing) · [License](#-license) · [Installation](#-installation)
