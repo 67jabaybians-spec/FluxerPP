@@ -303,8 +303,6 @@ A `429` response is retried once automatically (honoring `Retry-After`) before t
 ---
 ## ⚠️ Bottlenecks
 
-**This SDK only supports Windows** at the moment — the gateway transport is WinHTTP-specific. A cross-platform migration (likely IXWebSocket or Boost.Beast for the gateway, keeping libcurl for REST, which is already cross-platform) is planned but not started.
-
 Other known gaps, tracked so they don't get lost:
 - No persistent guild/channel cache on `FluxerClient`
 - `on_message_create` doesn't hydrate a `Message` model
